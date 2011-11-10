@@ -1,0 +1,3 @@
+#!/bin/sh
+
+rsync -avz ./build/ www-data@gibson.hgbrg.se:/var/www/david.hgbrg.se/public/blog/

@@ -1,0 +1,318 @@
+#!/bin/php
+<?php
+
+namespace express;
+
+# this is needed for the atom feed
+define( 'BASE_URL', 'http://david.hgbrg.se' );
+
+#
+### CLI interaction
+
+$args = parse_args( $argv );
+
+define( 'DBG', !!verbosity( $args ) );
+
+if ( is_help( $args ) ) {
+	printf( "Usage: %s [--help]", $argv[0] );
+}
+
+# perform the build process
+build( get_entries( __DIR__ . '/content/' ), __DIR__ . '/build/' );
+
+# that was all, really. only functions following.
+
+#
+### LIB
+
+function dbg( $msg ) {
+	if ( !defined( 'DBG' ) || !DBG ) return;
+	syslog( LOG_DEBUG | LOG_LOCAL2, $msg );
+}
+
+function path_join() {
+ 	$paths = array_filter( func_get_args() );
+  return preg_replace( '#/{2,}#', '/', implode( '/', $paths ) );
+}
+
+/** parses CLI args. see http://pwfisher.com/nucleus/index.php?itemid=45 */
+function parse_args( $argv ) {
+	array_shift($argv);
+	$out = array();
+	foreach ( $argv as $arg ) {
+		# --key or --key=val
+		if ( substr( $arg, 0, 2) == '--' ) {
+			$eqPos = strpos( $arg, '=' );
+			# --key
+			if ( $eqPos === false ) {
+				$key = substr( $arg, 2 );
+				$out[$key] = isset( $out[$key] ) ? $out[$key] : true;
+			# --key=val
+			} else {
+				$key = substr( $arg, 2, $eqPos - 2 );
+				$out[$key] = substr( $arg, $eqPos + 1 );
+			}
+		# -k=val or -klm
+		} elseif ( substr( $arg, 0, 1 ) == '-' ) {
+			# -k=val
+			if ( substr( $arg, 2, 1 ) == '=' ) {
+				$key = substr( $arg, 1, 1 );
+				$out[$key] = substr( $arg, 3 );
+			# -klm
+			} else {
+				foreach ( str_split( substr( $arg, 1 ) ) as $char ) {
+					$key = $char;
+					$out[$key] = isset($out[$key]) ? $out[$key] : true;
+				}
+			}
+		} else {
+				$out[] = $arg;
+		}
+	}
+	return $out;
+}
+
+function is_help( $args ) {
+	return @$args['help'];
+}
+
+function verbosity( $args ) {
+	return @$args['v'];
+}
+
+#
+### EXPRESS 2 CORE + UTILS
+
+class Entry {
+	public $updated_on;
+	public $created_on;
+	public $template;
+	public $url;
+	public $parser;
+	public $tags = array();
+	public $title;
+	public $body;
+	public $raw_body;
+}
+
+function base_url() {
+	return BASE_URL;
+}
+
+function get_template_content( $filename, $context ) {
+	ob_start();
+	extract( $context );
+	require $filename;
+	$c = ob_get_contents();
+	ob_end_clean();
+	return $c;
+}
+
+function sort_entries_by_date( $entries, $opts = array() ) {
+	$opts += array(
+		'order' => 'desc',
+	);
+	usort( $entries, function ( $a, $b ) use ( $opts ) {
+		switch ( $opts['order'] ) {
+			case 'desc':
+				return $b->created_on - $a->created_on;
+			default:
+				return $a->created_on - $b->created_on;
+		}
+	});
+	return $entries;
+}
+
+#
+### WRITING ENTRIES
+
+function build( $entries, $target_dir ) {
+	dbg( sprintf( "Building to '%s' ...", $target_dir ) );
+
+	$entries = sort_entries_by_date( $entries );
+
+	write_entries( $entries, $target_dir );
+	write_entry( $entries[0], path_join( $target_dir, 'index.html' ) );
+	sync_images( __DIR__ . '/static/', $target_dir );
+	write_atom( $entries, path_join( $target_dir, 'atom.xml' ) );
+	write_archive_page( $entries, path_join( $target_dir, 'archive.html' ) );
+}
+
+function write_entries( $entries, $target_dir ) {
+	dbg( sprintf( "Writing entries to '%s' ...", $target_dir ) );
+	foreach ( $entries as $entry ) {
+		write_entry( $entry, path_join( $target_dir,  $entry->url ) );
+	}
+}
+
+function write_atom( $entries, $filename ) {
+	dbg( sprintf( "Writing atom feed to '%s' ...", $filename ) );
+	$ctxt = array(
+		'entries' => $entries
+	);
+	return file_put_contents( $filename,
+		get_template_content( __DIR__ . '/templates/atom.xml.php', $ctxt ) );
+}
+
+function write_archive_page( $entries, $filename ) {
+	dbg( sprintf( "Writing archive page to '%s' ...", $filename ) );
+	$ctxt = array( 'entries' => $entries );
+	return file_put_contents( $filename,
+		get_template_content( __DIR__ . '/templates/archive.html.php', $ctxt ) );
+}
+
+function sync_images( $src_dir, $target_dir ) {
+	$cmd = sprintf( 'rsync -r "%s" "%s"', $src_dir, $target_dir );
+	dbg( sprintf( "Syncing images using '%s' ...", $cmd ) );
+	return system( $cmd );
+}
+
+function write_entry( $entry, $filename ) {
+	dbg( sprintf( "Writing entry to '%s' ...", $filename ) );
+
+	# write by getting content through template file
+	$ctxt = array( 'entry' => $entry );
+	file_put_contents( $filename,
+		get_template_content( $entry->template, $ctxt ) );
+}
+
+#
+### GETTING ENTRIES
+
+function get_entries( $dir ) {
+	dbg( sprintf( "Getting entries from dir '%s' ...", $dir ) );
+	$entries = array();
+	foreach ( glob( path_join( $dir, '/*' ) ) as $filename ) {
+		$entries[] = read_entry( $filename );
+	}
+	return $entries;
+}
+
+function read_entry( $filename ) {
+	dbg( sprintf( "Reading entry from '%s' ...", $filename ) );
+	
+	$e = new Entry();
+
+	$s = file_get_contents( $filename );
+	$s = "HTTP/1.1 200 OK\n" . $s;
+	$c = http_parse_message( $s );
+
+	$e->raw_body = $c->body;
+
+	$hs = array();
+	foreach ( $c->headers as $k => $v ) {
+		$hs[strtolower( $k )] = $v;
+	}
+
+	if ( @$hs['created'] ) {
+		$e->created_on = strtotime( $hs['created'] );
+	} else {
+		$e->created_on = filectime( $filename );
+	}
+
+	if ( @$hs['updated'] ) {
+		$e->updated_on = strtotime( $hs['updated'] );
+	} else {
+		$e->updated_on = filemtime( $filename );
+	}
+
+	if ( @$hs['template'] ) {
+		$e->template = __DIR__ . '/templates/' . $hs['template'] . '.html.php';
+	} else {
+		$e->template = __DIR__ . '/templates/default.html.php';
+	}
+
+	if ( @$hs['url'] ) {
+		$e->url = $hs['url'];
+	} else {
+		$e->url = get_default_url( $filename );
+	}
+
+	if ( @$hs['parser'] ) {
+		$e->parser = @$hs['parser'];
+	} else {
+		$e->parser = get_default_parser( $filename );
+	}
+
+	if ( @$hs['tags'] ) {
+		$e->tags = explode( ',', $hs['tags'] );
+		$e->tags = array_map( 'trim', $e->tags );
+	}
+
+	if ( @$hs['title'] ) {
+		$e->title = $hs['title'];
+	}
+
+	# parse content
+	if ( $e->parser ) {
+		$e->body = call_user_func( __NAMESPACE__ . '\parse_' . $e->parser,
+			$e->raw_body );
+	} else {
+		$e->body = $e->raw_body;
+	}
+
+	return $e;
+}
+
+function get_default_url( $filename ) {
+	if ( preg_match( '/[0-9\-_]*([0-9a-zA-Z_\-]+)\.[a-z]+/', $filename,
+		$matches ) ) {
+		return $matches[1] . '.html';
+	}
+}
+
+function get_default_parser( $filename ) {
+	$parts = explode( '.', $filename  );
+	switch ( array_pop( $parts ) ) {
+		case 'rst':
+			return 'rst';
+	}
+	# html is default
+	return 'html';
+}
+
+function get_related_entries( $entry ) {
+	$mapping = get_tag_to_entries_map( get_entries( __DIR__ . '/content/' ) );
+	$related = array();
+	foreach( $entry->tags as $tag ) {
+		foreach ( $mapping[$tag] as $e ) {
+			# given entry is related to itself, but lets not state the obvious
+			if ( $e->url != $entry->url ) $related[$e->title] = $e;
+		}
+	}
+	return $related;
+}
+
+function get_tag_to_entries_map( $entries ) {
+	$map = array();
+	foreach ( $entries as $e ) {
+		foreach ( $e->tags as $t ) {
+			if ( !isset( $map[$t] ) ) {
+				$map[$t] = array();
+			}
+			$map[$t][] = $e;
+		}
+	}
+	return $map;
+}
+
+## PARSERS
+
+function parse_html( $s ) {
+	return $s;
+}
+
+/** Parses ReST by shelving out to Python CLI bin. */
+function parse_rst( $s ) {
+	# let docutils take care of this
+	# reads from tempfile
+	$temp_filename = tempnam( sys_get_temp_dir(), 'express2' );
+	file_put_contents( $temp_filename, $s );
+	
+	ob_start();
+	# writes to stdout
+	passthru( sprintf( 'rst2html.py --no-doc-title --template="rst2html-tmpl.txt" "%s"', $temp_filename ) );
+	$s = ob_get_contents();
+	ob_end_clean();
+	return $s;
+}
