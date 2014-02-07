@@ -5,7 +5,7 @@ A minimal blogging engine/static site generator that takes a set of entries
 stored in plain text files and generates a set of static interlinked HTML
 files.
 
-See content/1-express2.rst for more info.
+See `content/1-express2.rst` for more info.
 
 ## Dependencies
 
